@@ -1,0 +1,109 @@
+--Ready-to-run SQL Agent Job version that will automatically scan all databases weekly, detect redundant indexes, and send an email report to your team.
+
+✅ Step 1 — Enable Database Mail (if not already)
+
+-- Enable Database Mail
+EXEC sp_configure 'show advanced options', 1;
+RECONFIGURE;
+EXEC sp_configure 'Database Mail XPs', 1;
+RECONFIGURE;
+
+-- Create a Database Mail profile (example)
+EXEC msdb.dbo.sysmail_add_account_sp
+    @account_name = 'DBAAlerts',
+    @description = 'DBA notifications',
+    @email_address = 'dba_team@example.com',
+    @display_name = 'SQL Server DBA Alerts',
+    @mailserver_name = 'smtp.example.com';
+
+EXEC msdb.dbo.sysmail_add_profile_sp
+    @profile_name = 'DBAAlertsProfile',
+    @description = 'Profile for DBA notifications';
+
+EXEC msdb.dbo.sysmail_add_profileaccount_sp
+    @profile_name = 'DBAAlertsProfile',
+    @account_name = 'DBAAlerts',
+    @sequence_number = 1;
+
+✅ Step 2 — Create the Reporting Procedure
+
+CREATE PROCEDURE dbo.GetRedundantIndexes_Report
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    -- Temporary table for results
+    IF OBJECT_ID('tempdb..#RedundantIndexes') IS NOT NULL
+        DROP TABLE #RedundantIndexes;
+
+    CREATE TABLE #RedundantIndexes
+    (
+        DatabaseName SYSNAME,
+        SchemaName SYSNAME,
+        TableName SYSNAME,
+        MainIndex SYSNAME,
+        RedundantIndex SYSNAME,
+        MainIndexKeys NVARCHAR(MAX),
+        RedundantIndexKeys NVARCHAR(MAX),
+        MainInclude NVARCHAR(MAX),
+        RedundantInclude NVARCHAR(MAX),
+        IndexSizeMB DECIMAL(18,2),
+        FragmentationPct DECIMAL(5,2),
+        UserSeeks BIGINT,
+        UserScans BIGINT,
+        UserLookups BIGINT,
+        UserUpdates BIGINT,
+        Recommendation NVARCHAR(500)
+    );
+
+    -- Execute full scan (use previous SP logic here)
+    EXEC dbo.GetRedundantIndexes_AllDatabases_Full;
+
+    -- Export results to HTML table for email
+    DECLARE @html NVARCHAR(MAX);
+    SET @html = N'<h2>Redundant Indexes Report - ' + CONVERT(NVARCHAR, GETDATE(), 120) + '</h2>' +
+                N'<table border="1" cellspacing="0" cellpadding="3">' +
+                N'<tr><th>DB</th><th>Schema</th><th>Table</th><th>MainIndex</th><th>RedundantIndex</th>' +
+                N'<th>SizeMB</th><th>Frag%</th><th>Seeks</th><th>Scans</th><th>Lookups</th><th>Updates</th><th>Recommendation</th></tr>';
+
+    SELECT @html = @html +
+           '<tr><td>' + DatabaseName + '</td><td>' + SchemaName + '</td><td>' + TableName + '</td>' +
+           '<td>' + MainIndex + '</td><td>' + RedundantIndex + '</td>' +
+           '<td>' + CAST(IndexSizeMB AS NVARCHAR) + '</td><td>' + CAST(FragmentationPct AS NVARCHAR) + '</td>' +
+           '<td>' + CAST(UserSeeks AS NVARCHAR) + '</td><td>' + CAST(UserScans AS NVARCHAR) + '</td>' +
+           '<td>' + CAST(UserLookups AS NVARCHAR) + '</td><td>' + CAST(UserUpdates AS NVARCHAR) + '</td>' +
+           '<td>' + Recommendation + '</td></tr>'
+    FROM #RedundantIndexes;
+
+    SET @html = @html + N'</table>';
+
+    -- Send email
+    EXEC msdb.dbo.sp_send_dbmail
+        @profile_name = 'DBAAlertsProfile',
+        @recipients = 'dba_team@example.com',
+        @subject = 'Weekly Redundant Indexes Report',
+        @body = @html,
+        @body_format = 'HTML';
+END;
+GO
+
+✅ Step 3 — Create SQL Agent Job
+
+1. Open SQL Server Agent → Jobs → New Job
+2. Name: `Weekly Redundant Index Scan`
+3. Steps → New Step:
+
+  Type: Transact-SQL script (T-SQL)
+  Command:
+     EXEC dbo.GetRedundantIndexes_Report;
+
+4. Schedule → Weekly → choose your day/time (e.g., Sunday 2 AM)
+5. Notifications → optional: alert if job fails
+
+✅ What This Job Does
+
+1. Scans all user databases weekly
+2. Detects redundant indexes
+3. Collects size, fragmentation, and usage stats
+4. Sends HTML email report to your team
+5. Provides actionable recommendations
