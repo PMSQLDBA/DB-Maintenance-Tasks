@@ -1,0 +1,119 @@
+--Reference: https://www.madeiradata.com/post/every-redundant-index-in-every-database-all-at-once
+--Below given script detects redundant indexes across all databases but also provides index size, fragmentation, usage stats, and DROP recommendations. 
+--This will give you a complete picture and actionable insights.
+
+/*
+Features
+1) Scans all user databases automatically
+2) Detects redundant indexes (keys + includes)
+3) Shows index size in MB
+4) Shows fragmentation %
+5) Shows usage stats: seeks, scans, lookups, updates
+6) Provides a recommendation for each redundant index (drop/review/optional)
+7) Ordered by database → table → largest index first
+8) This gives you a DBA-ready tool to analyze, document, and safely remove redundant indexes.
+*/
+
+use master
+go
+CREATE PROCEDURE dbo.GetRedundantIndexes_AllDatabases_Full
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    -- Temporary table to store results
+    IF OBJECT_ID('tempdb..#RedundantIndexes') IS NOT NULL
+        DROP TABLE #RedundantIndexes;
+
+    CREATE TABLE #RedundantIndexes
+    (
+        DatabaseName SYSNAME,
+        SchemaName SYSNAME,
+        TableName SYSNAME,
+        MainIndex SYSNAME,
+        RedundantIndex SYSNAME,
+        MainIndexKeys NVARCHAR(MAX),
+        RedundantIndexKeys NVARCHAR(MAX),
+        MainInclude NVARCHAR(MAX),
+        RedundantInclude NVARCHAR(MAX),
+        IndexSizeMB DECIMAL(18,2),
+        FragmentationPct DECIMAL(5,2),
+        UserSeeks BIGINT,
+        UserScans BIGINT,
+        UserLookups BIGINT,
+        UserUpdates BIGINT,
+        Recommendation NVARCHAR(500)
+    );
+
+    DECLARE @DB SYSNAME, @SQL NVARCHAR(MAX);
+
+    DECLARE db_cursor CURSOR FOR
+    SELECT name FROM sys.databases
+    WHERE database_id > 4 AND state_desc='ONLINE';
+
+    OPEN db_cursor;
+    FETCH NEXT FROM db_cursor INTO @DB;
+
+    WHILE @@FETCH_STATUS = 0
+    BEGIN
+        SET @SQL = 'USE ' + QUOTENAME(@DB) + ';
+WITH idx AS (
+    SELECT DB_NAME() AS DatabaseName,
+           sch.name AS SchemaName,
+           tbl.name AS TableName,
+           idx.index_id,
+           idx.name AS IndexName,
+           STUFF((SELECT '','' + c.name 
+                  FROM sys.index_columns ic
+                  JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id
+                  WHERE ic.object_id=idx.object_id AND ic.index_id=idx.index_id AND ic.is_included_column=0
+                  ORDER BY ic.key_ordinal FOR XML PATH(''''), TYPE).value(''.'',''NVARCHAR(MAX)''),1,1,'''') AS KeyCols,
+           STUFF((SELECT '','' + c.name 
+                  FROM sys.index_columns ic
+                  JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id
+                  WHERE ic.object_id=idx.object_id AND ic.index_id=idx.index_id AND ic.is_included_column=1
+                  ORDER BY ic.key_ordinal FOR XML PATH(''''), TYPE).value(''.'',''NVARCHAR(MAX)''),1,1,'''') AS IncludeCols,
+           ps.reserved_page_count * 8.0 / 1024 AS IndexSizeMB,
+           frag.avg_fragmentation_in_percent AS FragmentationPct,
+           ISNULL(iu.user_seeks,0) AS UserSeeks,
+           ISNULL(iu.user_scans,0) AS UserScans,
+           ISNULL(iu.user_lookups,0) AS UserLookups,
+           ISNULL(iu.user_updates,0) AS UserUpdates
+    FROM sys.indexes idx
+    JOIN sys.tables tbl ON idx.object_id=tbl.object_id
+    JOIN sys.schemas sch ON tbl.schema_id=sch.schema_id
+    LEFT JOIN sys.dm_db_index_physical_stats(DB_ID(), NULL, NULL, NULL, ''LIMITED'') frag
+        ON idx.object_id = frag.object_id AND idx.index_id = frag.index_id
+    LEFT JOIN sys.dm_db_partition_stats ps
+        ON idx.object_id = ps.object_id AND idx.index_id = ps.index_id
+    LEFT JOIN sys.dm_db_index_usage_stats iu
+        ON iu.object_id = idx.object_id AND iu.index_id = idx.index_id AND iu.database_id = DB_ID()
+    WHERE idx.is_primary_key=0 AND idx.is_unique=0 AND idx.index_id>0
+)
+INSERT INTO #RedundantIndexes
+SELECT A.DatabaseName, A.SchemaName, A.TableName, A.IndexName AS MainIndex,
+       B.IndexName AS RedundantIndex, A.KeyCols AS MainIndexKeys, B.KeyCols AS RedundantIndexKeys,
+       A.IncludeCols AS MainInclude, B.IncludeCols AS RedundantInclude,
+       B.IndexSizeMB, B.FragmentationPct, B.UserSeeks, B.UserScans, B.UserLookups, B.UserUpdates,
+       CASE 
+           WHEN B.IndexSizeMB > 100 THEN ''Large redundant index → Consider DROP''
+           WHEN B.IndexSizeMB BETWEEN 20 AND 100 THEN ''Medium redundant index → Review usage''
+           ELSE ''Small redundant index → Optional to keep or drop''
+       END AS Recommendation
+FROM idx A
+JOIN idx B ON A.SchemaName=B.SchemaName AND A.TableName=B.TableName AND A.IndexName<>B.IndexName
+           AND A.KeyCols=B.KeyCols AND (A.IncludeCols=B.IncludeCols OR A.IncludeCols LIKE B.IncludeCols+''%'');';
+
+        EXEC (@SQL);
+
+        FETCH NEXT FROM db_cursor INTO @DB;
+    END
+
+    CLOSE db_cursor;
+    DEALLOCATE db_cursor;
+
+    SELECT *
+    FROM #RedundantIndexes
+    ORDER BY DatabaseName, SchemaName, TableName, IndexSizeMB DESC;
+END;
+GO
